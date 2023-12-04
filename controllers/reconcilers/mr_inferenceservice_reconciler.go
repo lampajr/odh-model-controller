@@ -9,18 +9,22 @@ import (
 	kservev1beta1 "github.com/kserve/kserve/pkg/apis/serving/v1beta1"
 	mrapi "github.com/opendatahub-io/model-registry/pkg/api"
 	"github.com/opendatahub-io/model-registry/pkg/openapi"
+	"github.com/opendatahub-io/odh-model-controller/controllers/comparators"
 	"github.com/opendatahub-io/odh-model-controller/controllers/constants"
+	"github.com/opendatahub-io/odh-model-controller/controllers/processors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 type ModelRegistryInferenceServiceReconciler struct {
-	client client.Client
+	client         client.Client
+	deltaProcessor processors.DeltaProcessor
 }
 
 func NewModelRegistryInferenceServiceReconciler(client client.Client) *ModelRegistryInferenceServiceReconciler {
 	return &ModelRegistryInferenceServiceReconciler{
-		client: client,
+		client:         client,
+		deltaProcessor: processors.NewDeltaProcessor(),
 	}
 }
 
@@ -80,17 +84,16 @@ func (r *ModelRegistryInferenceServiceReconciler) ReconcileInferenceService(
 	}
 
 	// Look for existing ISVC by label and namespace
-	isvc, err := r.findInferenceService(ctx, log, is, namespace)
+	existingISVC, err := r.findInferenceService(ctx, log, is, namespace)
 	if err != nil {
 		log.Error(err, "Unable to find ISVC in the current namespace")
 	}
 
 	isInDeployedState := isInferenceServiceDeployed(is)
-	isvcExists := isvc != nil
+	isvcExists := existingISVC != nil
 
-	if !isvcExists && isInDeployedState {
+	if !isvcExists && isInDeployedState { // Create new desired ISVC
 
-		// Create new desired ISVC
 		log.Info("ISVC not existing and IS state is DEPLOYED, creating ISVC: " + isName)
 
 		// Create ServeModel
@@ -100,26 +103,25 @@ func (r *ModelRegistryInferenceServiceReconciler) ReconcileInferenceService(
 			log.Error(err, "something went wrong creating desired ServeModel")
 		}
 
-		isvc, err := r.createDesiredInferenceService(ctx, namespace, isName, mrClient, is, sm)
+		desiredISVC, err := r.createDesiredInferenceService(ctx, namespace, isName, mrClient, is, sm)
 		if err != nil {
 			return fmt.Errorf("something went wrong creating desired InferenceService CR: %w", err)
 		}
 
-		if err = r.client.Create(ctx, isvc); err != nil {
+		if err = r.processDelta(ctx, log, desiredISVC, nil); err != nil {
 			r.updateServeModelState(mrClient, is, sm, openapi.EXECUTIONSTATE_FAILED)
 			return fmt.Errorf("something went wrong applying the desired InferenceService CR")
 		}
 
 		log.Info("Created desired ISVC: " + isName)
 
-	} else if isvcExists && !isInDeployedState {
+	} else if isvcExists && !isInDeployedState { // Delete existing ISVC
 
-		// Delete existing ISVC
 		log.Info("ISVC existing and IS state is UNDEPLOYED, removing ISVC: " + isName)
 
 		// Get corresponding ServeModel
 		var sm *openapi.ServeModel
-		smId, ok := isvc.Labels[constants.ModelRegistryInferenceServiceSMLabel]
+		smId, ok := existingISVC.Labels[constants.ModelRegistryInferenceServiceSMLabel]
 		if ok {
 			// get by id
 			sm, err = mrClient.GetServeModelById(smId)
@@ -131,12 +133,17 @@ func (r *ModelRegistryInferenceServiceReconciler) ReconcileInferenceService(
 			log.Error(err, "Error retrieving ServeModel")
 		}
 
-		if err = r.client.Delete(ctx, isvc); err != nil {
-			_, err = r.updateServeModelState(mrClient, is, sm, openapi.EXECUTIONSTATE_UNKNOWN)
-			if err != nil {
-				log.Error(err, "Error updating ServeModel")
+		// Skip deletion if GetDeletionTimestamp != nil
+		if existingISVC.GetDeletionTimestamp() == nil {
+			if err = r.processDelta(ctx, log, nil, existingISVC); err != nil {
+				_, err = r.updateServeModelState(mrClient, is, sm, openapi.EXECUTIONSTATE_UNKNOWN)
+				if err != nil {
+					log.Error(err, "Error updating ServeModel")
+				}
+				return fmt.Errorf("something went wrong deleting InferenceService CR")
 			}
-			return fmt.Errorf("something went wrong deleting InferenceService CR")
+		} else {
+			log.Info("ISVC already marked to be deleted")
 		}
 
 		_, err = r.updateServeModelState(mrClient, is, sm, openapi.EXECUTIONSTATE_COMPLETE)
@@ -146,13 +153,13 @@ func (r *ModelRegistryInferenceServiceReconciler) ReconcileInferenceService(
 
 		log.Info("Deleted ISVC: " + isName)
 
-	} else if isvcExists && isInDeployedState {
+	} else if isvcExists && isInDeployedState { // Update the existing ISVC
 
 		log.Info("ISVC existing and IS state is DEPLOYED")
 
 		// Get corresponding ServeModel
 		var sm *openapi.ServeModel
-		smId, ok := isvc.Labels[constants.ModelRegistryInferenceServiceSMLabel]
+		smId, ok := existingISVC.Labels[constants.ModelRegistryInferenceServiceSMLabel]
 		if ok {
 			// get by id
 			sm, err = mrClient.GetServeModelById(smId)
@@ -170,9 +177,21 @@ func (r *ModelRegistryInferenceServiceReconciler) ReconcileInferenceService(
 			log.Error(err, "Error updating ServeModel")
 		}
 
-		// TODO: check if existing != desired, if so update the ISVC
+		desiredISVC, err := r.createDesiredInferenceService(ctx, namespace, isName, mrClient, is, sm)
+		if err != nil {
+			return fmt.Errorf("something went wrong creating desired InferenceService CR: %w", err)
+		}
 
-	} else {
+		// Update the existing CR if there are changes
+		if err = r.processDelta(ctx, log, desiredISVC, existingISVC); err != nil {
+			_, err = r.updateServeModelState(mrClient, is, sm, openapi.EXECUTIONSTATE_UNKNOWN)
+			if err != nil {
+				log.Error(err, "Error updating ServeModel")
+			}
+			return fmt.Errorf("something went wrong deleting InferenceService CR")
+		}
+
+	} else { // Skip InferenceService reconciliation
 
 		log.Info("ISVC not existing and IS state is UNDEPLOYED, skipping InferenceService")
 
@@ -190,6 +209,41 @@ func (r *ModelRegistryInferenceServiceReconciler) ReconcileInferenceService(
 
 	}
 
+	return nil
+}
+
+func (r *ModelRegistryInferenceServiceReconciler) processDelta(ctx context.Context, log logr.Logger, desiredISVC *kservev1beta1.InferenceService, existingISVC *kservev1beta1.InferenceService) (err error) {
+	comparator := comparators.GetInferenceServiceComparator()
+	delta := r.deltaProcessor.ComputeDelta(comparator, desiredISVC, existingISVC)
+
+	if !delta.HasChanges() {
+		log.V(1).Info("No delta found")
+		return nil
+	}
+
+	if delta.IsAdded() {
+		log.V(1).Info("Delta found", "create", desiredISVC.GetName())
+		if err = r.client.Create(ctx, desiredISVC); err != nil {
+			return
+		}
+	}
+
+	if delta.IsUpdated() {
+		log.V(1).Info("Delta found", "update", existingISVC.GetName())
+		rp := existingISVC.DeepCopy()
+		rp.Spec.Predictor = desiredISVC.Spec.Predictor
+
+		if err = r.client.Update(ctx, rp); err != nil {
+			return
+		}
+	}
+
+	if delta.IsRemoved() {
+		log.V(1).Info("Delta found", "delete", existingISVC.GetName())
+		if err = r.client.Delete(ctx, existingISVC); err != nil {
+			return
+		}
+	}
 	return nil
 }
 
