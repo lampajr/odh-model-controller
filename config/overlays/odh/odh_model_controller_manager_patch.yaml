@@ -9,8 +9,7 @@ spec:
       containers:
         - args:
             - --leader-elect
-            - "--monitoring-namespace"
-            - "$(MONITORING_NS)"
+            - --model-registry-inference-reconcile
           image: $(odh-model-controller) 
           env:
             - name: MONITORING_NS
